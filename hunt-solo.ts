@@ -672,9 +672,9 @@ Is this a real bug that the fix correctly addresses? Output ONLY: {"real": true/
           console.log(`    ✗ ${f.file}:${f.startLine} rejected: ${obj.reason ?? ''}`);
         }
       }
-    } catch {
-      // If consensus check fails, keep the finding (benefit of the doubt)
-      confirmed.push(f);
+    } catch (e: any) {
+      // If model doesn't exist or is down, reject (don't auto-confirm)
+      console.log(`    ? ${f.file}:${f.startLine} consensus error: ${e?.message ?? e}`);
     }
   }
 
@@ -696,27 +696,32 @@ async function syntaxCheck(fixedContent: string, filePath: string): Promise<bool
     }
 
     if (lang === 'python') {
-      // python3 -c "compile(source, 'f', 'exec')"
-      const tmp = `/tmp/hunt-syntax-check.py`;
+      const tmp = `/tmp/hunt-syntax-${Math.random().toString(36).slice(2)}.py`;
       await Bun.write(tmp, fixedContent);
-      const proc = Bun.spawn(['python3', '-c', `compile(open("${tmp}").read(), "f", "exec")`], {
-        stdout: 'pipe', stderr: 'pipe',
-      });
-      return (await proc.exited) === 0;
+      try {
+        const proc = Bun.spawn(['python3', '-c', `compile(open("${tmp}").read(), "f", "exec")`], {
+          stdout: 'pipe', stderr: 'pipe',
+        });
+        return (await proc.exited) === 0;
+      } finally { try { await Bun.file(tmp).exists() && (await import('node:fs/promises')).unlink(tmp); } catch {} }
     }
 
     if (lang === 'go') {
-      const tmp = `/tmp/hunt-syntax-check.go`;
+      const tmp = `/tmp/hunt-syntax-${Math.random().toString(36).slice(2)}.go`;
       await Bun.write(tmp, fixedContent);
-      const proc = Bun.spawn(['gofmt', '-e', tmp], { stdout: 'pipe', stderr: 'pipe' });
-      return (await proc.exited) === 0;
+      try {
+        const proc = Bun.spawn(['gofmt', '-e', tmp], { stdout: 'pipe', stderr: 'pipe' });
+        return (await proc.exited) === 0;
+      } finally { try { await Bun.file(tmp).exists() && (await import('node:fs/promises')).unlink(tmp); } catch {} }
     }
 
     if (lang === 'ruby') {
-      const tmp = `/tmp/hunt-syntax-check.rb`;
+      const tmp = `/tmp/hunt-syntax-${Math.random().toString(36).slice(2)}.rb`;
       await Bun.write(tmp, fixedContent);
-      const proc = Bun.spawn(['ruby', '-c', tmp], { stdout: 'pipe', stderr: 'pipe' });
-      return (await proc.exited) === 0;
+      try {
+        const proc = Bun.spawn(['ruby', '-c', tmp], { stdout: 'pipe', stderr: 'pipe' });
+        return (await proc.exited) === 0;
+      } finally { try { await Bun.file(tmp).exists() && (await import('node:fs/promises')).unlink(tmp); } catch {} }
     }
 
     // For languages we can't easily check, fall back to bracket balance
@@ -751,7 +756,7 @@ function parseLlmFindings(raw: string, files: RepoFile[]): BugFinding[] {
     if (!f?.file || !fm.has(f.file)) return false;
     const lc = fm.get(f.file)!.content.split('\n').length;
     if (typeof f.startLine !== 'number' || f.startLine < 1) return false;
-    if (typeof f.endLine !== 'number' || f.endLine < f.startLine || f.endLine > lc + 5) return false;
+    if (typeof f.endLine !== 'number' || f.endLine < f.startLine || f.endLine > lc) return false;
     if (f.confidence !== 'medium' && f.confidence !== 'high') return false;
     if (!VALID_BUG_TYPES.has(f.bugType)) return false;
     if (!f.originalCode || !f.fixedCode) return false;
@@ -771,7 +776,7 @@ function validate(f: BugFinding, files: RepoFile[]): boolean {
   if (!file) return false;
   if (f.startLine < 1 || f.endLine > file.content.split('\n').length) return false;
   if (f.originalCode.trim() === f.fixedCode.trim()) return false;
-  if (!findInFile(file.content, f.originalCode, f.startLine)) return false;
+  if (findInFile(file.content, f.originalCode, f.startLine) === null) return false;
   const oL = f.originalCode.length, fL = f.fixedCode.length;
   if (oL > 0 && (fL > oL * 4 || fL < oL * 0.1)) return false;
   const bal = (s: string) => { let n = 0; for (const c of s) { if ('{(['.includes(c)) n++; if ('})]'.includes(c)) n--; } return n; };
@@ -788,7 +793,9 @@ function findInFile(content: string, orig: string, hint: number): { start: numbe
   const nOrig = norm(orig);
   const lines = content.split('\n');
   const oLC = orig.split('\n').filter((l) => l.trim()).length;
-  const lo = Math.max(0, hint - 11), hi = Math.min(lines.length, hint + 10);
+  // hint is 1-based from LLM, convert to 0-based for array indexing
+  const h0 = hint - 1;
+  const lo = Math.max(0, h0 - 10), hi = Math.min(lines.length, h0 + 11);
   for (let i = lo; i <= hi - oLC; i++) {
     for (let len = oLC - 1; len <= oLC + 2 && i + len <= lines.length; len++) {
       if (norm(lines.slice(i, i + len).join('\n')) === nOrig) return { start: i, end: i + len - 1 };
@@ -798,7 +805,7 @@ function findInFile(content: string, orig: string, hint: number): { start: numbe
 }
 
 function applyFix(content: string, f: BugFinding): string {
-  if (content.includes(f.originalCode)) return content.replace(f.originalCode, f.fixedCode);
+  if (content.includes(f.originalCode)) return content.split(f.originalCode).join(f.fixedCode);
   const m = findInFile(content, f.originalCode, f.startLine);
   if (m) {
     const l = content.split('\n');
