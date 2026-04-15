@@ -23,6 +23,12 @@
 //   HUNT_MODEL_2              optional (second model for consensus — set to enable)
 //   HUNT_MAX_ATTEMPTS         optional (max repos to try in --loop mode, default 5)
 //   HUNT_MIN_REPO_SCORE       optional (minimum repo score to target, default 30)
+//   HUNT_TOPICS               optional (comma-separated GitHub topics, e.g. "react,nextjs,api")
+//   HUNT_KEYWORDS             optional (extra search terms, e.g. "web framework")
+//   HUNT_STARS_MIN            optional (min stars, default 50)
+//   HUNT_STARS_MAX            optional (max stars, default 10000)
+//   HUNT_PUSHED_DAYS          optional (max days since last push, default 90)
+//   HUNT_REPOS_FILE           optional (path to file with owner/repo list, one per line)
 //
 // Exit codes:
 //   0 = PR opened (or dry-run found bug)
@@ -42,6 +48,38 @@ const stats: {
   repoScore?: number;
   repo?: string;
 } = { llmCalls: 0, apiCalls: 0, osvCalls: 0, semgrepRan: false, startedAt: Date.now() };
+
+// ─── Niche targeting config ───
+
+interface NicheConfig {
+  topics: string[];         // GitHub topics to filter on
+  keywords: string;         // Extra search terms
+  starsMin: number;         // Min stars
+  starsMax: number;         // Max stars
+  pushedDays: number;       // Max days since last push
+  reposFile: string[];      // Curated repo list from file
+}
+
+function loadNicheConfig(): NicheConfig {
+  const topics = (process.env.HUNT_TOPICS ?? '').split(',').map((t) => t.trim()).filter(Boolean);
+  const keywords = (process.env.HUNT_KEYWORDS ?? '').trim();
+  const starsMin = parseInt(process.env.HUNT_STARS_MIN ?? '50', 10);
+  const starsMax = parseInt(process.env.HUNT_STARS_MAX ?? '10000', 10);
+  const pushedDays = parseInt(process.env.HUNT_PUSHED_DAYS ?? '90', 10);
+
+  let reposFile: string[] = [];
+  const reposPath = process.env.HUNT_REPOS_FILE;
+  if (reposPath) {
+    try {
+      const raw = require('node:fs').readFileSync(reposPath, 'utf8') as string;
+      reposFile = raw.split('\n').map((l: string) => l.trim()).filter((l: string) => l && !l.startsWith('#') && l.includes('/'));
+    } catch { /* file not found or unreadable */ }
+  }
+
+  return { topics, keywords, starsMin, starsMax, pushedDays, reposFile };
+}
+
+const niche = loadNicheConfig();
 
 // ─── LLM client (OpenRouter, OpenAI-compatible) ───
 
@@ -404,6 +442,15 @@ async function main() {
   if (args.autoYes) log('  AUTO-CONFIRM — no prompts');
   if (args.loop) log(`  LOOP MODE — up to ${args.maxAttempts} repos`);
 
+  // Log niche config if customized
+  const nicheDetails: string[] = [];
+  if (niche.topics.length > 0) nicheDetails.push(`topics: ${niche.topics.join(', ')}`);
+  if (niche.keywords) nicheDetails.push(`keywords: "${niche.keywords}"`);
+  if (niche.starsMin !== 50 || niche.starsMax !== 10000) nicheDetails.push(`stars: ${niche.starsMin}–${niche.starsMax}`);
+  if (niche.pushedDays !== 90) nicheDetails.push(`pushed: <${niche.pushedDays}d`);
+  if (niche.reposFile.length > 0) nicheDetails.push(`repos file: ${niche.reposFile.length} repos`);
+  if (nicheDetails.length > 0) log(`  niche: ${nicheDetails.join(' | ')}`);
+
   const history = await loadHistory();
   const triedThisRun = new Set<string>();
 
@@ -623,7 +670,48 @@ async function fetchBugIssues(api: ReturnType<typeof gh>, repo: string): Promise
   }
 }
 
-// ─── Target discovery (wider randomization) ───
+// ─── Target discovery (niche-aware) ───
+
+function buildStarBuckets(): [number, number][] {
+  const { starsMin, starsMax } = niche;
+  // If user set a tight range, use it directly
+  if (starsMax - starsMin < 500) return [[starsMin, starsMax]];
+  // Build overlapping buckets within the user's range
+  const range = starsMax - starsMin;
+  const step = Math.max(200, Math.floor(range / 5));
+  const buckets: [number, number][] = [];
+  for (let lo = starsMin; lo < starsMax; lo += step) {
+    buckets.push([lo, Math.min(lo + step * 2, starsMax)]);
+  }
+  return buckets.length > 0 ? buckets : [[starsMin, starsMax]];
+}
+
+function buildSearchQualifiers(lang: string, bucket: [number, number], days: number): string {
+  const parts = [`language:${lang}`, `stars:${bucket[0]}..${bucket[1]}`, `pushed:>${dAgo(days)}`];
+  for (const t of niche.topics) parts.push(`topic:${t}`);
+  if (niche.keywords) parts.push(niche.keywords);
+  return parts.join(' ');
+}
+
+async function loadReposFromFile(
+  api: ReturnType<typeof gh>,
+  history: HuntHistory,
+  triedThisRun: Set<string>,
+): Promise<{ name: string; stars: number; daysAgo: number } | null> {
+  const candidates = shuffle([...niche.reposFile]);
+  for (const r of candidates) {
+    if (triedThisRun.has(r)) continue;
+    if (history.scanned[r] && Date.now() - Date.parse(history.scanned[r]) < 30 * 86400000) continue;
+    try {
+      const d = await api.get(`/repos/${r}`);
+      if (d.archived || d.fork) continue;
+      const stars = d.stargazers_count ?? 0;
+      const daysAgo = Math.floor((Date.now() - Date.parse(d.pushed_at ?? '')) / 86400000);
+      return { name: r, stars, daysAgo };
+    } catch { continue; }
+  }
+  return null;
+}
 
 async function findTarget(
   api: ReturnType<typeof gh>,
@@ -631,7 +719,14 @@ async function findTarget(
   history: HuntHistory,
   triedThisRun: Set<string>,
 ): Promise<{ name: string; stars: number; daysAgo: number } | null> {
-  // Wider variety of search strategies
+  // Priority 1: curated repos file (if provided)
+  if (niche.reposFile.length > 0) {
+    const fromFile = await loadReposFromFile(api, history, triedThisRun);
+    if (fromFile) return fromFile;
+    // Fall through to search if file list is exhausted
+  }
+
+  // Priority 2: GitHub search with niche filters
   const searches = [
     () => issueSearch(api, lang, 'bug'),
     () => issueSearch(api, lang, 'help wanted'),
@@ -641,7 +736,6 @@ async function findTarget(
     () => repoSearch(api, lang, 'help-wanted-issues'),
   ];
 
-  // Shuffle search order each run for variety
   shuffle(searches);
 
   for (const search of searches) {
@@ -653,9 +747,9 @@ async function findTarget(
         try {
           const d = await api.get(`/repos/${r}`);
           const stars = d.stargazers_count ?? 0;
-          if (stars < 50 || stars > 10_000 || d.archived || d.fork) continue;
+          if (stars < niche.starsMin || stars > niche.starsMax || d.archived || d.fork) continue;
           const daysAgo = Math.floor((Date.now() - Date.parse(d.pushed_at ?? '')) / 86400000);
-          if (daysAgo > 90) continue;
+          if (daysAgo > niche.pushedDays) continue;
           return { name: r, stars, daysAgo };
         } catch { continue; }
       }
@@ -665,11 +759,12 @@ async function findTarget(
 }
 
 async function issueSearch(api: ReturnType<typeof gh>, lang: string, label: string): Promise<string[]> {
-  // Much wider star range randomization
-  const starBuckets = [[50, 300], [200, 800], [500, 2000], [1000, 5000], [2000, 8000]];
-  const bucket = starBuckets[Math.floor(Math.random() * starBuckets.length)];
-  const days = [30, 45, 60, 90][Math.floor(Math.random() * 4)];
-  const q = encodeURIComponent(`language:${lang} stars:${bucket[0]}..${bucket[1]} pushed:>${dAgo(days)} label:"${label}"`);
+  const buckets = buildStarBuckets();
+  const bucket = buckets[Math.floor(Math.random() * buckets.length)];
+  const dayOpts = [30, 45, 60, 90].filter((d) => d <= niche.pushedDays);
+  const days = dayOpts[Math.floor(Math.random() * dayOpts.length)] ?? niche.pushedDays;
+  const quals = buildSearchQualifiers(lang, bucket, days);
+  const q = encodeURIComponent(`${quals} label:"${label}"`);
   const page = 1 + Math.floor(Math.random() * 3);
   const d = await api.get(`/search/issues?q=${q}&sort=created&per_page=15&page=${page}`);
   const repos = (d.items ?? []).map((i: any) => (i.repository_url as string).match(/\/repos\/(.+)$/)?.[1]).filter(Boolean) as string[];
@@ -677,11 +772,12 @@ async function issueSearch(api: ReturnType<typeof gh>, lang: string, label: stri
 }
 
 async function repoSearch(api: ReturnType<typeof gh>, lang: string, sort: string): Promise<string[]> {
-  const starBuckets = [[50, 500], [200, 1500], [500, 3000], [1000, 5000], [2000, 10000]];
-  const bucket = starBuckets[Math.floor(Math.random() * starBuckets.length)];
-  const days = [30, 60, 90][Math.floor(Math.random() * 3)];
+  const buckets = buildStarBuckets();
+  const bucket = buckets[Math.floor(Math.random() * buckets.length)];
+  const dayOpts = [30, 60, 90].filter((d) => d <= niche.pushedDays);
+  const days = dayOpts[Math.floor(Math.random() * dayOpts.length)] ?? niche.pushedDays;
+  const q = encodeURIComponent(buildSearchQualifiers(lang, bucket, days));
   const page = 1 + Math.floor(Math.random() * 5);
-  const q = encodeURIComponent(`language:${lang} stars:${bucket[0]}..${bucket[1]} pushed:>${dAgo(days)}`);
   const d = await api.get(`/search/repositories?q=${q}&sort=${sort}&per_page=20&page=${page}`);
   return (d.items ?? []).map((i: any) => i.full_name as string);
 }

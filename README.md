@@ -106,7 +106,7 @@ bun run hunt-solo.ts <user> <pat> typescript --loop --yes --json
 hunt-solo runs a 10-step pipeline per repo:
 
 ```
- 1. Find target         Search GitHub for repos with bug/help-wanted issues
+ 1. Find target         Curated repos file → niche-filtered GitHub search
  2. Score repo          Community health, external PR merge rate, anti-bot check
  3. Fetch bug issues    Open issues labeled "bug" — used as LLM context
  4. Download source     Top 20 source files via GitHub tree + blob API
@@ -140,6 +140,82 @@ pip install semgrep
 ```
 
 When semgrep is not installed, hunt-solo falls back to LLM-only screening. No functionality is lost.
+
+## Niche targeting
+
+By default hunt-solo searches broadly across your chosen language. Use env vars to dial in exactly what you want to hunt.
+
+### Topics & keywords
+
+```bash
+# Only target repos tagged with specific GitHub topics
+export HUNT_TOPICS="react,nextjs"
+
+# Add search terms (anything GitHub search supports)
+export HUNT_KEYWORDS="web framework"
+
+# Combine — targets React/Next.js web framework repos
+export HUNT_TOPICS="react,nextjs" HUNT_KEYWORDS="web framework"
+```
+
+### Star range & recency
+
+```bash
+# Small repos only (easier to get PRs merged)
+export HUNT_STARS_MIN=50
+export HUNT_STARS_MAX=500
+
+# Big repos only (more visibility)
+export HUNT_STARS_MIN=2000
+export HUNT_STARS_MAX=50000
+
+# Only repos pushed in the last 2 weeks
+export HUNT_PUSHED_DAYS=14
+```
+
+### Curated repos file
+
+For maximum control, point to a file with specific repos to target:
+
+```bash
+export HUNT_REPOS_FILE=~/.hunt-repos.txt
+```
+
+Format — one `owner/repo` per line, `#` comments supported:
+
+```text
+# High-value targets I want to contribute to
+vercel/next.js
+facebook/react
+denoland/deno
+
+# My niche — Rust CLI tools
+sharkdp/bat
+BurntSushi/ripgrep
+```
+
+Repos from the file are tried first (shuffled). If all are exhausted or already scanned, falls back to GitHub search with your other niche filters.
+
+### Example setups
+
+```bash
+# "I want to fix bugs in small Python ML repos"
+export HUNT_TOPICS="machine-learning,deep-learning"
+export HUNT_STARS_MIN=100
+export HUNT_STARS_MAX=2000
+bun run hunt-solo.ts myuser ghp_xxx python --loop --yes
+
+# "I want to hit specific high-profile TypeScript repos"
+export HUNT_REPOS_FILE=~/.hunt-ts-targets.txt
+export HUNT_MIN_REPO_SCORE=20  # lower threshold since these are hand-picked
+bun run hunt-solo.ts myuser ghp_xxx typescript --loop --yes
+
+# "I want fresh, active Go repos that welcome contributors"
+export HUNT_PUSHED_DAYS=14
+export HUNT_STARS_MIN=200
+export HUNT_STARS_MAX=5000
+bun run hunt-solo.ts myuser ghp_xxx go --loop --yes
+```
 
 ## Multi-key routing
 
@@ -193,6 +269,12 @@ export HUNT_MODEL_2="deepseek/deepseek-chat-v3-0324:free"
 | `HUNT_MODEL_2` | no | — | Second model for consensus mode |
 | `HUNT_MAX_ATTEMPTS` | no | `5` | Max repos to try in `--loop` mode |
 | `HUNT_MIN_REPO_SCORE` | no | `30` | Minimum repo score to target |
+| `HUNT_TOPICS` | no | — | Comma-separated GitHub topics (e.g. `react,nextjs`) |
+| `HUNT_KEYWORDS` | no | — | Extra search terms (e.g. `web framework`) |
+| `HUNT_STARS_MIN` | no | `50` | Minimum stars for target repos |
+| `HUNT_STARS_MAX` | no | `10000` | Maximum stars for target repos |
+| `HUNT_PUSHED_DAYS` | no | `90` | Max days since last push |
+| `HUNT_REPOS_FILE` | no | — | Path to file with `owner/repo` list (one per line) |
 
 ### Recommended free models
 
@@ -237,7 +319,7 @@ Single file, zero runtime dependencies.
 hunt-solo.ts (1600 LOC)
 ├── LLM layer         OpenRouterClient + LlmRouter (multi-key failover)
 ├── GitHub API        Rate-limit-aware REST client
-├── Target discovery  Issue search + repo search (randomized)
+├── Target discovery  Niche-filtered search + curated repos file
 ├── Repo scoring      Community health + merge rate + anti-bot
 ├── OSV scanning      Dependency parsing + OSV.dev batch API
 ├── Semgrep           Optional static analysis pre-filter
