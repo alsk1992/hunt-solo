@@ -1,0 +1,14 @@
+{
+  "name": "hunt-solo",
+  "version": "1.0.0",
+  "description": "One-shot bug hunter — find real bugs in GitHub repos, open PRs to fix them. Uses free LLMs.",
+  "scripts": {
+    "start": "bun run hunt-solo.ts",
+    "hunt": "bun run hunt-solo.ts"
+  },
+  "type": "module",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
