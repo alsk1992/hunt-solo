@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
-// hunt-solo v3 — automated bug hunter.
+// hunt-solo v4 — automated bug hunter with pro integrations.
 // Find real bugs in GitHub repos → open PRs to fix them.
 // Zero dependencies beyond Bun. Uses free OpenRouter models.
+// Includes: multi-key LLM routing, repo scoring, OSV vuln scanning, semgrep integration.
 //
 // Usage:
 //   bun run hunt-solo.ts
@@ -15,10 +16,13 @@
 //
 // Env:
 //   OPENROUTER_API_KEY        required (free at openrouter.ai/keys)
+//   OPENROUTER_API_KEY_2      optional (second key for rate limit spreading)
+//   OPENROUTER_API_KEY_3      optional (third key for rate limit spreading)
 //   GITHUB_PAT                optional (alternative to passing as arg)
 //   HUNT_MODEL                optional (default: meta-llama/llama-4-maverick:free)
 //   HUNT_MODEL_2              optional (second model for consensus — set to enable)
 //   HUNT_MAX_ATTEMPTS         optional (max repos to try in --loop mode, default 5)
+//   HUNT_MIN_REPO_SCORE       optional (minimum repo score to target, default 30)
 //
 // Exit codes:
 //   0 = PR opened (or dry-run found bug)
@@ -28,7 +32,16 @@
 
 // ─── Stats tracker ───
 
-const stats = { llmCalls: 0, apiCalls: 0, startedAt: Date.now() };
+const stats: {
+  llmCalls: number;
+  apiCalls: number;
+  osvCalls: number;
+  semgrepRan: boolean;
+  startedAt: number;
+  bugSource?: string;
+  repoScore?: number;
+  repo?: string;
+} = { llmCalls: 0, apiCalls: 0, osvCalls: 0, semgrepRan: false, startedAt: Date.now() };
 
 // ─── LLM client (OpenRouter, OpenAI-compatible) ───
 
@@ -79,6 +92,36 @@ class OpenRouterClient implements LlmClient {
   }
 }
 
+// ─── LLM Router (multi-key failover) ───
+
+class LlmRouter implements LlmClient {
+  readonly model: string;
+  private entries: { client: LlmClient; exhaustedUntil: number }[];
+
+  constructor(clients: LlmClient[]) {
+    this.entries = clients.map((c) => ({ client: c, exhaustedUntil: 0 }));
+    this.model = `multi:${clients.length}`;
+  }
+
+  async complete(prompt: string, opts?: LlmOptions): Promise<string> {
+    const now = Date.now();
+    let lastError: unknown;
+    for (const entry of this.entries) {
+      if (entry.exhaustedUntil > now) continue;
+      try {
+        return await entry.client.complete(prompt, opts);
+      } catch (e: any) {
+        lastError = e;
+        const msg = e?.message ?? '';
+        if (msg.includes('rate-limited') || msg.includes('429')) {
+          entry.exhaustedUntil = now + 5 * 60_000; // 5 min cooldown
+        }
+      }
+    }
+    throw lastError ?? new Error('all LLM providers exhausted');
+  }
+}
+
 async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let last: unknown;
   for (let i = 0; i < attempts; i++) {
@@ -113,7 +156,7 @@ function gh(pat: string) {
     'Authorization': `token ${pat}`,
     'Accept': 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'hunt-solo/3.0',
+    'User-Agent': 'hunt-solo/4.0',
   };
   return {
     async get(path: string): Promise<any> {
@@ -170,7 +213,7 @@ function gh(pat: string) {
 
 type BugType = 'null-check' | 'dead-import' | 'missing-error-handling' | 'off-by-one'
   | 'resource-leak' | 'logic-bug' | 'missing-edge-case' | 'broken-route'
-  | 'missing-return' | 'incorrect-comparison';
+  | 'missing-return' | 'incorrect-comparison' | 'dependency-vuln';
 
 interface BugFinding {
   file: string;
@@ -195,6 +238,16 @@ interface BugCandidate {
   hint: string;
 }
 
+interface VulnResult {
+  id: string;
+  summary: string;
+  pkg: string;
+  ecosystem: string;
+  currentVersion: string;
+  fixedVersion: string;
+  severity: string;
+}
+
 // ─── Config ───
 
 const LANGS = ['typescript', 'javascript', 'python', 'go', 'rust', 'java', 'ruby', 'swift', 'kotlin', 'c', 'cpp'] as const;
@@ -212,7 +265,7 @@ const SKIP = new Set([
 const VALID_BUG_TYPES = new Set<string>([
   'null-check', 'dead-import', 'missing-error-handling', 'off-by-one',
   'resource-leak', 'logic-bug', 'missing-edge-case', 'broken-route',
-  'missing-return', 'incorrect-comparison',
+  'missing-return', 'incorrect-comparison', 'dependency-vuln',
 ]);
 
 const LANG_EXT: Record<string, string> = {
@@ -303,19 +356,31 @@ const EXIT_NO_BUGS = 2;
 const EXIT_NO_TARGET = 3;
 
 async function main() {
-  log('═══ hunt-solo v3 — automated bug hunter ═══\n');
+  log('═══ hunt-solo v4 — automated bug hunter ═══\n');
 
+  // Build LLM clients from available OpenRouter keys
+  const clients: LlmClient[] = [];
   const orKey = process.env.OPENROUTER_API_KEY;
-  if (!orKey) {
+  const orKey2 = process.env.OPENROUTER_API_KEY_2;
+  const orKey3 = process.env.OPENROUTER_API_KEY_3;
+  const model1 = process.env.HUNT_MODEL ?? 'meta-llama/llama-4-maverick:free';
+
+  if (orKey) clients.push(new OpenRouterClient(orKey, model1));
+  if (orKey2) clients.push(new OpenRouterClient(orKey2, model1));
+  if (orKey3) clients.push(new OpenRouterClient(orKey3, model1));
+
+  if (clients.length === 0) {
     logErr('missing OPENROUTER_API_KEY — get a free key at https://openrouter.ai/keys');
     process.exit(EXIT_ERROR);
   }
 
   const args = await parseArgs();
-  const model1 = process.env.HUNT_MODEL ?? 'meta-llama/llama-4-maverick:free';
+  const llm = clients.length === 1 ? clients[0] : new LlmRouter(clients);
+
+  // Consensus model uses primary key
   const model2 = process.env.HUNT_MODEL_2;
-  const llm = new OpenRouterClient(orKey, model1);
-  const llm2 = model2 ? new OpenRouterClient(orKey, model2) : null;
+  const llm2 = model2 && orKey ? new OpenRouterClient(orKey, model2) : null;
+
   const api = gh(args.pat);
 
   // Verify creds
@@ -332,8 +397,9 @@ async function main() {
     process.exit(EXIT_ERROR);
   }
 
-  if (llm2) log(`models: ${model1} + ${model2} (consensus mode)`);
+  if (clients.length > 1) log(`llm: ${model1} × ${clients.length} keys (router mode)`);
   else log(`model: ${model1}`);
+  if (llm2) log(`consensus: ${model2}`);
   if (args.dryRun) log('  DRY RUN — will not open PR');
   if (args.autoYes) log('  AUTO-CONFIRM — no prompts');
   if (args.loop) log(`  LOOP MODE — up to ${args.maxAttempts} repos`);
@@ -359,12 +425,16 @@ async function main() {
   if (args.json) {
     const jsonOut: any = {
       result: lastResult,
-      llmCalls: stats.llmCalls,
-      apiCalls: stats.apiCalls,
-      durationMs: Date.now() - stats.startedAt,
+      ...(stats.repo ? { repo: stats.repo } : {}),
       ...(lastResult === 'success' && history.prs.length > 0
         ? { prUrl: history.prs[history.prs.length - 1].url, repo: history.prs[history.prs.length - 1].repo }
         : {}),
+      source: stats.bugSource ?? 'llm',
+      repoScore: stats.repoScore,
+      llmCalls: stats.llmCalls,
+      apiCalls: stats.apiCalls,
+      osvCalls: stats.osvCalls,
+      durationMs: Date.now() - stats.startedAt,
     };
     console.log(JSON.stringify(jsonOut));
   }
@@ -385,6 +455,7 @@ async function huntOnce(
   history: HuntHistory,
   triedThisRun: Set<string>,
 ): Promise<HuntResult> {
+  const minScore = parseInt(process.env.HUNT_MIN_REPO_SCORE ?? '30', 10);
 
   // 1. Find target
   let targetName: string;
@@ -409,54 +480,99 @@ async function huntOnce(
   triedThisRun.add(targetName);
   history.scanned[targetName] = new Date().toISOString();
 
-  // 2. Mine bug issues for context
+  // 2. Score repo (community health, merge rate, anti-bot check)
+  log(`scoring repo...`);
+  const { score: repoScore, reasons: scoreReasons } = await scoreRepo(api, targetName);
+  log(`  repo score: ${repoScore} [${scoreReasons.join(', ')}]`);
+  stats.repoScore = repoScore;
+  stats.repo = targetName;
+  if (repoScore < minScore) {
+    log(`  score ${repoScore} < min ${minScore} — skipping`);
+    return 'no-bug';
+  }
+
+  // 3. Mine bug issues for context
   const bugIssues = await fetchBugIssues(api, targetName);
   if (bugIssues.length > 0) log(`  ${bugIssues.length} open bug issue(s) — using as context`);
 
-  // 3. Download source files (with pacing)
+  // 4. Download source files (with pacing)
   log(`downloading source files...`);
   const files = await downloadFiles(api, targetName);
   log(`  ${files.length} files (${(files.reduce((s, f) => s + f.content.length, 0) / 1024).toFixed(1)} KB)`);
   if (files.length === 0) { log('  no analyzable source files'); return 'no-bug'; }
 
-  // 4. Two-pass analysis — parallel screening, then focused deep analysis
-  log(`\npass 1: screening ${files.length} files with ${llm.model}...`);
-  const candidates = await screenFilesParallel(llm, files, targetName, bugIssues);
-  log(`  ${candidates.length} suspect(s)`);
-  if (candidates.length === 0) { log('  no bugs found'); return 'no-bug'; }
+  // 5. OSV dependency scan (deterministic, no LLM needed)
+  log('scanning dependencies...');
+  const vulnResult = await scanDependencies(api, targetName);
 
-  log(`pass 2: deep analysis on suspects...`);
-  const findings = await deepAnalyze(llm, files, candidates, targetName, bugIssues);
-  log(`  ${findings.length} finding(s)`);
+  let best: BugFinding;
 
-  // 5. Multi-model consensus
-  let confirmed = findings;
-  if (llm2 && findings.length > 0) {
-    log(`consensus check with ${llm2.model}...`);
-    confirmed = await consensusFilter(llm2, files, findings, targetName);
-    log(`  ${confirmed.length} confirmed by second model`);
+  if (vulnResult) {
+    log(`  dependency vuln found: ${vulnResult.finding.description}`);
+    best = vulnResult.finding;
+    stats.bugSource = 'osv';
+    // Add the dep file to files array so submitPR can find it
+    if (!files.find((f) => f.path === vulnResult.depFile.path)) {
+      files.push(vulnResult.depFile);
+    }
+  } else {
+    log('  no dependency vulns');
+
+    // 6. Screening: semgrep if available, else LLM
+    let candidates: BugCandidate[];
+    if (await hasSemgrep()) {
+      log(`\npass 1: semgrep scanning...`);
+      stats.semgrepRan = true;
+      candidates = await runSemgrep(files);
+      if (candidates.length > 0) {
+        log(`  semgrep found ${candidates.length} issue(s) — skipping LLM screening`);
+        stats.bugSource = 'semgrep+llm';
+      } else {
+        log(`  semgrep clean — falling back to LLM screening`);
+        candidates = await screenFilesParallel(llm, files, targetName, bugIssues);
+      }
+    } else {
+      log(`\npass 1: screening ${files.length} files with ${llm.model}...`);
+      candidates = await screenFilesParallel(llm, files, targetName, bugIssues);
+    }
+    log(`  ${candidates.length} suspect(s)`);
+    if (candidates.length === 0) { log('  no bugs found'); return 'no-bug'; }
+
+    // 7. Deep analysis (LLM, windowed)
+    log(`pass 2: deep analysis on suspects...`);
+    const findings = await deepAnalyze(llm, files, candidates, targetName, bugIssues);
+    log(`  ${findings.length} finding(s)`);
+
+    // 8. Multi-model consensus
+    let confirmed = findings;
+    if (llm2 && findings.length > 0) {
+      log(`consensus check with ${llm2.model}...`);
+      confirmed = await consensusFilter(llm2, files, findings, targetName);
+      log(`  ${confirmed.length} confirmed by second model`);
+    }
+
+    // 9. Validate + syntax check
+    const valid = confirmed.filter((f) => validate(f, files));
+    log(`  ${valid.length} passed validation`);
+
+    const syntaxOk: BugFinding[] = [];
+    for (const f of valid) {
+      const file = files.find((x) => x.path === f.file);
+      if (!file) continue;
+      const fixed = applyFix(file.content, f);
+      if (fixed === file.content) continue;
+      const ok = await syntaxCheck(fixed, f.file);
+      if (ok) syntaxOk.push(f);
+      else log(`  syntax check failed: ${f.file}:${f.startLine}`);
+    }
+    log(`  ${syntaxOk.length} passed syntax check`);
+
+    if (syntaxOk.length === 0) { log('  no actionable bugs survived'); return 'no-bug'; }
+    best = syntaxOk.sort((a, b) => confScore(b.confidence) - confScore(a.confidence))[0];
+    if (!stats.bugSource) stats.bugSource = 'llm';
   }
 
-  // 6. Validate
-  const valid = confirmed.filter((f) => validate(f, files));
-  log(`  ${valid.length} passed validation`);
-
-  // 7. Syntax-check
-  const syntaxOk: BugFinding[] = [];
-  for (const f of valid) {
-    const file = files.find((x) => x.path === f.file);
-    if (!file) continue;
-    const fixed = applyFix(file.content, f);
-    if (fixed === file.content) continue;
-    const ok = await syntaxCheck(fixed, f.file);
-    if (ok) syntaxOk.push(f);
-    else log(`  syntax check failed: ${f.file}:${f.startLine}`);
-  }
-  log(`  ${syntaxOk.length} passed syntax check`);
-
-  if (syntaxOk.length === 0) { log('  no actionable bugs survived'); return 'no-bug'; }
-
-  const best = syntaxOk.sort((a, b) => confScore(b.confidence) - confScore(a.confidence))[0];
+  // 10. Show bug
   log(`\n  bug: ${best.bugType} in ${best.file}:${best.startLine}`);
   log(`  ${best.description}`);
   log(`\n  original:`);
@@ -464,13 +580,13 @@ async function huntOnce(
   log(`  fix:`);
   best.fixedCode.split('\n').forEach((l) => log(`    + ${l}`));
 
-  // 8. Dry run
+  // Dry run
   if (args.dryRun) {
     log('\n  DRY RUN — skipping PR creation');
     return 'success';
   }
 
-  // 9. Confirm (skip if --yes)
+  // Confirm (skip if --yes)
   if (!args.autoYes) {
     const ok = await ask('\nopen PR? (y/n): ');
     if (ok.toLowerCase() !== 'y') { log('aborted'); return 'no-bug'; }
@@ -478,7 +594,7 @@ async function huntOnce(
     log('\n  auto-confirming PR...');
   }
 
-  // 10. Fork + branch + commit + PR
+  // Fork + branch + commit + PR
   const prUrl = await submitPR(api, args.username, targetName, best, files, llm);
   log(`\n  PR opened: ${prUrl}\n`);
 
@@ -538,9 +654,9 @@ async function findTarget(
           const d = await api.get(`/repos/${r}`);
           const stars = d.stargazers_count ?? 0;
           if (stars < 50 || stars > 10_000 || d.archived || d.fork) continue;
-          const dAgo = Math.floor((Date.now() - Date.parse(d.pushed_at ?? '')) / 86400000);
-          if (dAgo > 90) continue;
-          return { name: r, stars, daysAgo: dAgo };
+          const daysAgo = Math.floor((Date.now() - Date.parse(d.pushed_at ?? '')) / 86400000);
+          if (daysAgo > 90) continue;
+          return { name: r, stars, daysAgo };
         } catch { continue; }
       }
     } catch { continue; }
@@ -568,6 +684,73 @@ async function repoSearch(api: ReturnType<typeof gh>, lang: string, sort: string
   const q = encodeURIComponent(`language:${lang} stars:${bucket[0]}..${bucket[1]} pushed:>${dAgo(days)}`);
   const d = await api.get(`/search/repositories?q=${q}&sort=${sort}&per_page=20&page=${page}`);
   return (d.items ?? []).map((i: any) => i.full_name as string);
+}
+
+// ─── Repo scoring (community health, merge rate, anti-bot detection) ───
+
+async function scoreRepo(
+  api: ReturnType<typeof gh>,
+  repo: string,
+): Promise<{ score: number; reasons: string[] }> {
+  const [o, n] = repo.split('/');
+  let score = 50;
+  const reasons: string[] = [];
+
+  // Community health profile
+  try {
+    const profile = await api.get(`/repos/${o}/${n}/community/profile`);
+    const health = profile.health_percentage ?? 0;
+    score += Math.floor(health / 5); // 0-20 pts
+    reasons.push(`health:${health}%`);
+    if (profile.files?.contributing) { score += 15; reasons.push('CONTRIBUTING'); }
+    if (profile.files?.pull_request_template) { score += 5; reasons.push('PR template'); }
+  } catch { /* community profile not available for all repos */ }
+
+  // External PR merge rate (sample last 30 closed PRs)
+  try {
+    const pulls = await api.get(`/repos/${o}/${n}/pulls?state=closed&per_page=30`);
+    const external = (pulls ?? []).filter((p: any) =>
+      ['NONE', 'FIRST_TIMER', 'FIRST_TIME_CONTRIBUTOR', 'CONTRIBUTOR'].includes(p.author_association),
+    );
+    const merged = external.filter((p: any) => p.merged_at);
+    if (external.length >= 3) {
+      const rate = merged.length / external.length;
+      if (rate > 0.5) { score += 25; reasons.push(`merge:${(rate * 100).toFixed(0)}%`); }
+      else if (rate > 0.3) { score += 15; reasons.push(`merge:${(rate * 100).toFixed(0)}%`); }
+      else if (rate < 0.2) { score -= 20; reasons.push(`merge:${(rate * 100).toFixed(0)}%(low)`); }
+      else { reasons.push(`merge:${(rate * 100).toFixed(0)}%`); }
+    }
+  } catch { /* non-fatal */ }
+
+  // Anti-bot: scan CI workflows for bot detection
+  try {
+    const tree = await api.get(`/repos/${o}/${n}/git/trees/HEAD:.github/workflows`);
+    for (const entry of (tree.tree ?? []).slice(0, 10)) {
+      if (entry.type !== 'blob') continue;
+      try {
+        const blob = await api.get(`/repos/${o}/${n}/git/blobs/${entry.sha}`);
+        const content = Buffer.from(blob.content, 'base64').toString('utf8');
+        if (/contributor-report|ai-moderator|spam-detection/i.test(content)) {
+          reasons.push(`anti-bot:${entry.path}`);
+          return { score: 0, reasons };
+        }
+      } catch { /* skip unreadable blobs */ }
+    }
+  } catch { /* no .github/workflows — that's fine */ }
+
+  // Anti-bot: check CONTRIBUTING.md for prompt injection traps
+  try {
+    const contrib = await api.get(`/repos/${o}/${n}/contents/CONTRIBUTING.md`);
+    if (contrib.content) {
+      const text = Buffer.from(contrib.content, 'base64').toString('utf8');
+      if (/include the phrase|mention that you are|say the word/i.test(text)) {
+        reasons.push('prompt-injection-trap');
+        return { score: 0, reasons };
+      }
+    }
+  } catch { /* no CONTRIBUTING.md */ }
+
+  return { score, reasons };
 }
 
 // ─── File download (with pacing) ───
@@ -615,6 +798,277 @@ async function downloadFiles(api: ReturnType<typeof gh>, repo: string): Promise<
     await sleep(50);
   }
   return files;
+}
+
+// ─── Dependency vulnerability scanning (OSV.dev) ───
+
+interface DepInfo {
+  name: string;
+  version: string;
+  ecosystem: string;
+}
+
+const DEP_FILES = ['package.json', 'requirements.txt', 'go.mod', 'Cargo.toml', 'Gemfile.lock'];
+
+const ECOSYSTEM_MAP: Record<string, string[]> = {
+  npm: ['package.json'],
+  PyPI: ['requirements.txt'],
+  Go: ['go.mod'],
+  'crates.io': ['Cargo.toml'],
+  RubyGems: ['Gemfile.lock'],
+};
+
+async function fetchDepFiles(api: ReturnType<typeof gh>, repo: string): Promise<RepoFile[]> {
+  const [o, n] = repo.split('/');
+  const files: RepoFile[] = [];
+  for (const path of DEP_FILES) {
+    try {
+      const data = await api.get(`/repos/${o}/${n}/contents/${path}`);
+      if (data.content) {
+        files.push({
+          path,
+          content: Buffer.from(data.content, 'base64').toString('utf8'),
+          sha: data.sha,
+        });
+      }
+    } catch { /* file doesn't exist */ }
+  }
+  return files;
+}
+
+function parseDeps(files: RepoFile[]): DepInfo[] {
+  const deps: DepInfo[] = [];
+
+  for (const f of files) {
+    // package.json
+    if (f.path === 'package.json' || f.path.endsWith('/package.json')) {
+      try {
+        const pkg = JSON.parse(f.content);
+        for (const [name, ver] of Object.entries({ ...pkg.dependencies, ...pkg.devDependencies })) {
+          const v = String(ver).replace(/^[\^~>=<]+/, '');
+          if (/^\d/.test(v)) deps.push({ name, version: v, ecosystem: 'npm' });
+        }
+      } catch { /* malformed json */ }
+    }
+
+    // requirements.txt
+    if (f.path === 'requirements.txt' || f.path.endsWith('/requirements.txt')) {
+      for (const line of f.content.split('\n')) {
+        const m = line.trim().match(/^([a-zA-Z0-9_.-]+)==(.+)$/);
+        if (m) deps.push({ name: m[1], version: m[2], ecosystem: 'PyPI' });
+      }
+    }
+
+    // go.mod
+    if (f.path === 'go.mod' || f.path.endsWith('/go.mod')) {
+      const reqBlock = f.content.match(/require\s*\(([\s\S]*?)\)/);
+      if (reqBlock) {
+        for (const line of reqBlock[1].split('\n')) {
+          const m = line.trim().match(/^(\S+)\s+(v\S+)/);
+          if (m) deps.push({ name: m[1], version: m[2], ecosystem: 'Go' });
+        }
+      }
+      // Single-line requires
+      for (const m of f.content.matchAll(/^require\s+(\S+)\s+(v\S+)/gm)) {
+        deps.push({ name: m[1], version: m[2], ecosystem: 'Go' });
+      }
+    }
+
+    // Cargo.toml
+    if (f.path === 'Cargo.toml' || f.path.endsWith('/Cargo.toml')) {
+      const depSection = f.content.match(/\[dependencies\]([\s\S]*?)(?:\n\[|$)/);
+      if (depSection) {
+        for (const line of depSection[1].split('\n')) {
+          const m = line.trim().match(/^([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"/);
+          if (m) deps.push({ name: m[1], version: m[2], ecosystem: 'crates.io' });
+        }
+      }
+    }
+
+    // Gemfile.lock
+    if (f.path === 'Gemfile.lock' || f.path.endsWith('/Gemfile.lock')) {
+      for (const line of f.content.split('\n')) {
+        const m = line.match(/^\s{4}(\S+)\s+\((\d[^)]*)\)/);
+        if (m) deps.push({ name: m[1], version: m[2], ecosystem: 'RubyGems' });
+      }
+    }
+  }
+
+  return deps;
+}
+
+async function queryOSV(deps: DepInfo[]): Promise<VulnResult[]> {
+  if (deps.length === 0) return [];
+  stats.osvCalls++;
+
+  const queries = deps.map((d) => ({
+    package: { name: d.name, ecosystem: d.ecosystem },
+    version: d.version,
+  }));
+
+  const vulns: VulnResult[] = [];
+  const BATCH = 1000;
+
+  for (let i = 0; i < queries.length; i += BATCH) {
+    const batch = queries.slice(i, i + BATCH);
+    try {
+      const res = await fetch('https://api.osv.dev/v1/querybatch', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ queries: batch }),
+      });
+      if (!res.ok) continue;
+
+      const data = (await res.json()) as { results: { vulns?: any[] }[] };
+
+      for (let j = 0; j < (data.results ?? []).length; j++) {
+        const result = data.results[j];
+        if (!result.vulns?.length) continue;
+        const dep = deps[i + j];
+
+        for (const v of result.vulns) {
+          // Find a fixed version
+          let fixedVersion = '';
+          for (const aff of v.affected ?? []) {
+            for (const range of aff.ranges ?? []) {
+              for (const event of range.events ?? []) {
+                if (event.fixed) { fixedVersion = event.fixed; break; }
+              }
+              if (fixedVersion) break;
+            }
+            if (fixedVersion) break;
+          }
+          if (!fixedVersion) continue; // skip vulns with no known fix
+
+          vulns.push({
+            id: v.id ?? 'unknown',
+            summary: (v.summary ?? v.details ?? '').slice(0, 200),
+            pkg: dep.name,
+            ecosystem: dep.ecosystem,
+            currentVersion: dep.version,
+            fixedVersion,
+            severity: v.database_specific?.severity ?? v.severity?.[0]?.type ?? 'UNKNOWN',
+          });
+        }
+      }
+    } catch { /* OSV API error — non-fatal */ }
+  }
+
+  return vulns;
+}
+
+function buildVulnFinding(depFile: RepoFile, vuln: VulnResult): BugFinding {
+  const lines = depFile.content.split('\n');
+  let originalCode = '';
+  let fixedCode = '';
+  let startLine = 1;
+  let endLine = 1;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(vuln.pkg) && lines[i].includes(vuln.currentVersion)) {
+      originalCode = lines[i];
+      fixedCode = lines[i].replace(vuln.currentVersion, vuln.fixedVersion);
+      startLine = i + 1;
+      endLine = i + 1;
+      break;
+    }
+  }
+
+  return {
+    file: depFile.path,
+    startLine,
+    endLine,
+    bugType: 'dependency-vuln',
+    confidence: 'high',
+    description: `${vuln.id}: ${vuln.summary} — upgrade ${vuln.pkg} from ${vuln.currentVersion} to ${vuln.fixedVersion}`,
+    originalCode,
+    fixedCode,
+  };
+}
+
+async function scanDependencies(
+  api: ReturnType<typeof gh>,
+  repo: string,
+): Promise<{ finding: BugFinding; depFile: RepoFile } | null> {
+  const depFiles = await fetchDepFiles(api, repo);
+  if (depFiles.length === 0) return null;
+
+  const deps = parseDeps(depFiles);
+  if (deps.length === 0) return null;
+
+  log(`  ${deps.length} deps across ${depFiles.length} manifest(s) — querying OSV.dev...`);
+  const vulns = await queryOSV(deps);
+  if (vulns.length === 0) return null;
+
+  log(`  ${vulns.length} vuln(s) with known fixes`);
+
+  // Pick first vuln (they come back in order from the batch)
+  const best = vulns[0];
+  const depFile = depFiles.find((f) =>
+    (ECOSYSTEM_MAP[best.ecosystem] ?? []).some((name) => f.path.endsWith(name)),
+  );
+  if (!depFile) return null;
+
+  const finding = buildVulnFinding(depFile, best);
+  if (!finding.originalCode) return null;
+
+  return { finding, depFile };
+}
+
+// ─── Semgrep static analysis ───
+
+let _semgrepAvailable: boolean | null = null;
+
+async function hasSemgrep(): Promise<boolean> {
+  if (_semgrepAvailable !== null) return _semgrepAvailable;
+  try {
+    const proc = Bun.spawn(['semgrep', '--version'], { stdout: 'pipe', stderr: 'pipe' });
+    _semgrepAvailable = (await proc.exited) === 0;
+  } catch {
+    _semgrepAvailable = false;
+  }
+  return _semgrepAvailable;
+}
+
+async function runSemgrep(files: RepoFile[]): Promise<BugCandidate[]> {
+  const tmpDir = `/tmp/hunt-semgrep-${Math.random().toString(36).slice(2)}`;
+  const { mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { dirname, join } = await import('node:path');
+
+  try {
+    await mkdir(tmpDir, { recursive: true });
+
+    // Write files preserving paths
+    for (const f of files) {
+      const fullPath = join(tmpDir, f.path);
+      await mkdir(dirname(fullPath), { recursive: true });
+      await writeFile(fullPath, f.content);
+    }
+
+    const proc = Bun.spawn(
+      ['semgrep', 'scan', '--config', 'auto', '--json', '--quiet', tmpDir],
+      { stdout: 'pipe', stderr: 'pipe' },
+    );
+
+    const output = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+
+    // semgrep: 0 = clean, 1 = findings, 2+ = errors
+    if (exitCode > 1) return [];
+
+    const data = JSON.parse(output);
+    const results = (data.results ?? []) as any[];
+
+    return results.slice(0, 10).map((r: any) => ({
+      file: (r.path as string).replace(tmpDir + '/', ''),
+      line: r.start?.line ?? 1,
+      hint: `[semgrep:${r.check_id}] ${r.extra?.message ?? r.check_id}`,
+    }));
+  } catch {
+    return [];
+  } finally {
+    try { await rm(tmpDir, { recursive: true, force: true }); } catch { /* cleanup best-effort */ }
+  }
 }
 
 // ─── Pass 1: Parallel screening (batch 4 at a time) ───
@@ -1131,7 +1585,14 @@ function confScore(c: string): number { return c === 'high' ? 3 : 2; }
 
 main().catch((e) => {
   if (jsonMode) {
-    console.log(JSON.stringify({ result: 'error', error: e instanceof Error ? e.message : String(e), llmCalls: stats.llmCalls, apiCalls: stats.apiCalls, durationMs: Date.now() - stats.startedAt }));
+    console.log(JSON.stringify({
+      result: 'error',
+      error: e instanceof Error ? e.message : String(e),
+      llmCalls: stats.llmCalls,
+      apiCalls: stats.apiCalls,
+      osvCalls: stats.osvCalls,
+      durationMs: Date.now() - stats.startedAt,
+    }));
   } else {
     console.error(e instanceof Error ? e.stack : String(e));
   }
